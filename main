@@ -1,0 +1,188 @@
+# =========================================================================
+# =========================================================================
+
+
+puts "--- STARTING INNOVUS SCRIPT FOR AES ---"
+
+###########################################################################
+## 1. Khoi tao & Mo khoa MMMC
+###########################################################################
+set DESIGN_NAME "AES"
+set NETLIST_FILE "inputs/AES_mapped.v"
+set LEF_FILES "/home/ICer/FreePDK45/osu_soc/lib/files/gscl45nm.lef"
+set MMMC_FILE "viewDefinition.tcl"
+
+if {![catch {open "/proc/cpuinfo"} f]} {
+  set CORES [regexp -all -line {^processor\s} [read $f]]
+  if {$CORES > 24} { set CORES 24 }
+  close $f
+}
+setDesignMode -process 45
+catch { setMultiCpuUsage -acquireLicense $CORES -localCpu $CORES }
+catch { setDistributeHost -local }
+
+set init_verilog $NETLIST_FILE
+set init_top_cell $DESIGN_NAME
+set init_lef_file $LEF_FILES
+set init_pwr_net "VDD"
+set init_gnd_net "VSS"
+set init_mmmc_file $MMMC_FILE
+
+set init_design_uniquify 1
+setGenerateViaMode -auto true
+init_design
+
+set_interactive_constraint_modes [all_constraint_modes]
+
+puts "--- Design Import & MMMC Unlocked Successful! ---"
+
+###########################################################################
+## 2. Floorplanning (50% - 20 20 20 20)
+###########################################################################
+set row [dbGet head.sites.size_y]
+if {$row == ""} { set row 1.68 }
+set pitch [expr 32*$row]
+
+set Density 0.50
+floorplan -r 1.0 $Density 20 20 20 20
+
+set FPx [dbGet top.fPlan.box_sizex]
+set FPy [dbGet top.fPlan.box_sizey]
+
+###########################################################################
+## 3. Power Planning
+###########################################################################
+clearGlobalNets
+
+globalNetConnect VDD -type pgpin -pin vdd -inst * -module {}
+globalNetConnect VSS -type pgpin -pin gnd -inst * -module {}
+globalNetConnect VDD -type net -net VDD
+globalNetConnect VSS -type net -net VSS
+
+addRing -nets {VSS VDD} -follow core -offset 5.0 -width 2.0 -spacing 1.0 \
+-layer {top metal5 bottom metal5 left metal6 right metal6}
+
+setAddStripeMode -break_at block_ring -allow_jog padcore_ring
+if {$FPx > [expr 1.5*$pitch]} {
+  addStripe -nets {VSS VDD} -layer metal5 -direction vertical \
+  -width 2.0 -spacing 1.0 -set_to_set_distance $pitch \
+  -start_from left -start_offset [expr $pitch-2.08]
+}
+if {$FPy > [expr 1.5*$pitch]} {
+  addStripe -nets {VSS VDD} -layer metal6 -direction horizontal \
+  -width 2.0 -spacing 1.0 -set_to_set_distance $pitch \
+  -start_from bottom -start_offset [expr $pitch-2.08]
+}
+editTrim -nets {VSS VDD}
+
+setSrouteMode -viaConnectToShape { ring stripe blockring }
+sroute -nets { VSS VDD } -connect corePin -corePinCheckStdcellGeoms \
+-allowJogging 0 -allowLayerChange 0; clearDrc
+
+###########################################################################
+## 4. Pin Assignment (Cach goc 20um)
+###########################################################################
+setPinConstraint -corner_to_pin_distance 20
+editPin -pin * -spreadDirection clockwise -side {Top Bottom Left Right} -layer metal3 -spreadType CENTER
+
+###########################################################################
+## 5. Placement
+###########################################################################
+setPlaceMode -reset
+placeDesign
+refinePlace
+
+###########################################################################
+## 6. CTS & Pre-Route (FIX: holdTargetSlack giam, them fixGlitch)
+###########################################################################
+setOptMode -reclaimArea true -leakageToDynamicRatio 0.5 -powerEffort high -fixFanoutLoad true
+optDesign -prefix preCTS -preCTS
+
+create_ccopt_clock_tree_spec -filename ccopt.spec
+source ccopt.spec
+
+catch { set_dont_use [get_lib_cells */CLKBUF*] false }
+catch { set_dont_use [get_lib_cells */INV*] false }
+catch { set_dont_use [get_lib_cells */BUF*] false }
+
+set_ccopt_property buffer_cells "CLKBUF1 CLKBUF2 CLKBUF3 BUFX2 BUFX4"
+set_ccopt_property inverter_cells "INVX1 INVX2 INVX4 INVX8"
+set_ccopt_property target_skew 0.25ns
+
+ccopt_design
+
+setOptMode -holdTargetSlack 0.05
+setOptMode -fixHoldAllowOverlap true
+setOptMode -fixHoldAllowResizing true
+setOptMode -fixHoldAllowSetupTnsDegrade true
+
+setOptMode -fixGlitch true
+
+optDesign -prefix postCTS -postCTS -setup -hold
+
+setFillerMode -core FILL
+addFiller -cell FILL -prefix FILLER_CELL
+
+###########################################################################
+## 7. Routing & Post Route Optimization
+###########################################################################
+
+setNanoRouteMode -reset
+setNanoRouteMode -drouteFixAntenna true \
+  -routeInsertAntennaDiode true \
+  -routeInsertDiodeForClockNets true \
+  -drouteAutoStop false \
+  -routeReserveSpaceForMultiCut true
+
+routeDesign
+routeDesign -viaOpt -wireOpt -trackOpt
+
+setAnalysisMode -analysisType onChipVariation -cppr both
+setExtractRCMode -engine postRoute -effortLevel low -useShieldingInDetailMode true
+
+deleteDanglingNet
+
+optDesign -prefix postRoute -postRoute -drv -setup -hold
+optDesign -prefix postRoute_holdfix -postRoute -hold
+
+setNanoRouteMode -droutePostRouteSwapVia true
+routeDesign -viaOpt
+setNanoRouteMode -reset
+
+setMetalFill -maxWidth 3.36 -minWidth 0.14 -maxLength 16.8 -minLength 0.14 -decrement 0.14 -activeSpacing 1.5 -gapSpacing 1.5 -maxDensity 70 -minDensity 30 -preferredDensity 50
+addMetalFill -snap -squareShape
+
+###########################################################################
+## 8. Verification & Export
+###########################################################################
+if {![file exists ./reports]} { file mkdir ./reports }
+if {![file exists ./outputs]} { file mkdir ./outputs }
+if {![file exists ./timingReports]} { file mkdir ./timingReports }
+if {![file exists ./verify_rpt]} { file mkdir ./verify_rpt }
+
+checkPlace ./verify_rpt/checkPlace.rpt
+verifyConnectivity -report ./verify_rpt/verifyConnectivity.rpt
+set_verify_drc_mode -exclude_pg_net true
+verify_drc -report ./verify_rpt/verify_drc.rpt
+
+report_power -hierarchy all -outfile reports/power.rpt
+report_area -out_file reports/area.rpt
+summaryReport -noHtml -outfile ./reports/summary.txt
+
+catch { report_timing -hold -max_paths 20 -nworst 1 -path_type full_clock \
+  > ./timingReports/postRoute_hold_worst.rpt }
+
+catch { timeDesign -postRoute -expandedViews -pathReports -drvReports -slackReports -numPaths 20 -outDir ./timingReports/ }
+catch { timeDesign -postRoute -hold -expandedViews -pathReports -slackReports -numPaths 20 -outDir ./timingReports/ }
+
+extractRC
+rcOut -spef ./outputs/AES.spef
+writeTimingCon ./outputs/AES_innovus.sdc
+saveNetlist -excludeLeafCell ./outputs/AES_innovus.v
+saveNetlist -excludeLeafCell -includePowerGround -includePhysicalInst ./outputs/AES_innovus_pg.v
+saveDesign ./outputs/AES.enc
+streamOut ./outputs/AES_final.gds -mapFile /home/ICer/FreePDK45/osu_soc/lib/files/gds2_encounter.map -dieAreaAsBoundary
+
+puts "========================================================="
+puts "========================================================="
+exit
